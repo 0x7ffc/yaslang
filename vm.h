@@ -2,16 +2,33 @@
 #define CLOX_VM_H
 
 #include "common.h"
+#include "value.h"
+#include "clox.h"
+#include "object.h"
 #include "chunk.h"
-
-#define STACK_MAX 256
+#include "compiler.h"
 
 typedef struct {
-  Chunk *chunk;
+  ObjFn *fn;
   uint8_t *ip;
+  Value *slots;
+} CallFrame;
+
+#define FRAME_MAX 64
+#define STACK_MAX (FRAME_MAX * UINT8_MAX)
+
+struct VM {
+  CallFrame frames[STACK_MAX];
+  int frameCount;
+  //Chunk *chunk;
+  //uint8_t *ip;
   Value stack[STACK_MAX];
   Value *sp;   // points to where the next value to be pushed will go
-} VM;
+  Table globals;
+  Table strings;
+  Obj *first;
+  Compiler *compiler;
+};
 
 typedef enum {
   INTERPRET_OK,
@@ -19,12 +36,8 @@ typedef enum {
   INTERPRET_RUNTIME_ERROR
 } InterpretResult;
 
-void initVM();
-
-void freeVM();
-
-InterpretResult interpret(const char *source);
-void push(Value value);
-Value pop();
+void initVM(VM *vm);
+void freeVM(VM *vm);
+InterpretResult interpret(VM *vm, const char *source);
 
 #endif

@@ -1,8 +1,12 @@
 #ifndef CLOX__COMPILER_H_
 #define CLOX__COMPILER_H_
 
-#include "chunk.h"
+#include "common.h"
+#include "clox.h"
+#include "object.h"
 
-bool compile(const char *source, Chunk *chunk);
+typedef struct sCompiler Compiler;
+
+ObjFn *compile(VM *vm, const char *source);
 
 #endif

@@ -11,7 +11,7 @@ void initChunk(Chunk *chunk) {
 }
 
 void freeChunk(Chunk *chunk) {
-  FREE_ARRAY(chunk->code);
+  FREE(chunk->code);
   freeValueArray(&chunk->constants);
   initChunk(chunk);
 }

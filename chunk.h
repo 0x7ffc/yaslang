@@ -10,7 +10,7 @@ typedef enum {
 #undef OPCODE
 } OpCode;
 
-typedef struct {
+typedef struct Chunk {
   int count;       // in use
   int capacity;    // allocated
   uint8_t *code;

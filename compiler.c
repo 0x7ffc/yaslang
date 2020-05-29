@@ -3,7 +3,7 @@
 #include <string.h>
 
 #include "compiler.h"
-#include "value.h"
+#include "vm.h"
 
 typedef enum {
   // Single-character tokens.
@@ -45,12 +45,33 @@ typedef struct {
 } Keyword;
 
 typedef struct {
+  VM *vm;
   const char *source;
   const char *tokenStart;
   const char *currentChar;
   Token current;
   Token previous;
 } Parser;
+
+typedef struct {
+  Token name;
+  int depth;
+} Local;
+
+typedef enum {
+  TYPE_FUNCTION,
+  TYPE_SCRIPT
+} FnType;
+
+struct sCompiler {
+  Parser *parser;
+  Local locals[UINT8_MAX + 1];
+  int localCount;
+  int scopeDepth;
+  ObjFn *fn;
+  FnType type;
+  struct sCompiler *parent;
+};
 
 typedef enum {
   PREC_NONE,
@@ -67,7 +88,7 @@ typedef enum {
   PREC_PRIMARY
 } Precedence;
 
-typedef void (*GrammarFn)(Parser *parser);
+typedef void (*GrammarFn)(Compiler *compiler, bool canAssign);
 
 typedef struct {
   GrammarFn prefix;
@@ -76,8 +97,10 @@ typedef struct {
 } GrammarRule;
 
 static GrammarRule *getRule(TokenType type);
-static void expression(Parser *parser);
-static void parsePrecedence(Parser *parser, Precedence precedence);
+static void expression(Compiler *compiler);
+static void statement(Compiler *compiler);
+static void declaration(Compiler *compiler);
+static void parsePrecedence(Compiler *compiler, Precedence precedence);
 
 static Keyword keywords[] = {
 	{"print", 5, TOKEN_PRINT},
@@ -144,10 +167,13 @@ static void readString(Parser *parser) {
   while (peekChar(parser) != '"' && !atEnd(parser)) {
 	nextChar(parser);
   }
-  if (matchChar(parser, '"'))
+  if (matchChar(parser, '"')) {
+	parser->current.value = newStringLength(parser->vm, parser->tokenStart + 1,
+											(int)(parser->currentChar - parser->tokenStart) - 2);
 	makeToken(parser, TOKEN_STRING);
-  else
+  } else {
 	makeToken(parser, TOKEN_ERROR);
+  }
 }
 
 static bool isName(char c) {
@@ -169,6 +195,8 @@ static void readName(Parser *parser) {
 	  return;
 	}
   }
+  parser->current.value = newStringLength(parser->vm, parser->tokenStart,
+										  (int)(parser->currentChar - parser->tokenStart));
   makeToken(parser, TOKEN_IDENTIFIER);
 }
 
@@ -178,7 +206,7 @@ static void readNumber(Parser *parser) {
 	nextChar(parser);
 	while (isDigit(peekChar(parser))) nextChar(parser);
   }
-  parser->current.value = strtod(parser->tokenStart, NULL);
+  parser->current.value = NUM_VAL(strtod(parser->tokenStart, NULL));
   makeToken(parser, TOKEN_NUMBER);
 }
 
@@ -250,134 +278,230 @@ static void nextToken(Parser *parser) {
   makeToken(parser, TOKEN_EOF);
 }
 
-static bool consume(Parser *parser, TokenType type) {
-  if (parser->current.type == type) {
-	nextToken(parser);
+static void initCompiler(Compiler *compiler, Parser *parser,
+						 Compiler *parent, FnType type) {
+  parser->vm->compiler = compiler;
+  compiler->parent = parent;
+  compiler->parser = parser;
+  compiler->localCount = 0;
+  compiler->scopeDepth = 0;
+  compiler->fn = newFn(parser->vm);
+  compiler->type = type;
+  if (type != TYPE_SCRIPT) {
+	compiler->fn->name = AS_STRING(newStringLength(parser->vm,
+												   parser->previous.start,
+												   parser->previous.length));
+  }
+  Local *local = &compiler->locals[compiler->localCount++];
+  local->depth = 0;
+  local->name.start = "";
+  local->name.length = 0;
+}
+
+static bool consume(Compiler *compiler, TokenType type) {
+  if (compiler->parser->current.type == type) {
+	nextToken(compiler->parser);
 	return true;
   }
   return false;
 }
 
-Chunk* compilingChunk;
-
-static Chunk *currentChunk() {
-  return compilingChunk;
+static void emitByte(Compiler *compiler, uint8_t byte) {
+  writeChunk(&compiler->fn->chunk, byte);
 }
 
-static void emitByte(uint8_t byte) {
-  writeChunk(currentChunk(), byte);
+static void emitBytes(Compiler *compiler, uint8_t byte1, uint8_t byte2) {
+  emitByte(compiler, byte1);
+  emitByte(compiler, byte2);
 }
 
-static void emitBytes(uint8_t byte1, uint8_t byte2) {
-  emitByte(byte1);
-  emitByte(byte2);
-}
-
-void emitConstant(Value value) {
-  int index = addConstant(currentChunk(), value);
+void emitConstant(Compiler *compiler, Value value) {
+  int index = addConstant(&compiler->fn->chunk, value);
   if (index < 256) {
-    emitBytes(OP_CONSTANT, index);
+	emitBytes(compiler, OP_CONSTANT, index);
   } else {
-    emitBytes(OP_CONSTANT_LONG, (uint8_t)(index & 0xff));
-    emitBytes((uint8_t)((index >> 8) & 0xff),
-    	(uint8_t)((index >> 16) & 0xff));
+	emitBytes(compiler, OP_CONSTANT_LONG, (uint8_t)(index & 0xff));
+	emitBytes(compiler, (uint8_t)((index >> 8) & 0xff),
+			  (uint8_t)((index >> 16) & 0xff));
   }
 }
 
-static void emitReturn() {
-  emitByte(OP_RETURN);
+static void emitReturn(Compiler *compiler) {
+  emitByte(compiler, OP_NIL);
+  emitByte(compiler, OP_RETURN);
 }
 
-static void endCompiler() {
-  emitReturn();
+static ObjFn *endCompiler(Compiler *compiler) {
+  emitReturn(compiler);
+  ObjFn *fn = compiler->fn;
+  compiler->parser->vm->compiler = compiler->parent;
+  return fn;
 }
 
-static void unary(Parser *parser) {
-  TokenType t = parser->previous.type;
-  parsePrecedence(parser, PREC_UNARY);
+static void unary(Compiler *compiler, bool canAssign) {
+  TokenType t = compiler->parser->previous.type;
+  parsePrecedence(compiler, PREC_UNARY);
   switch (t) {
-    case TOKEN_MINUS: emitByte(OP_NEGATE); break;
-	default:
-	  return;
+	case TOKEN_MINUS: emitByte(compiler, OP_NEGATE);
+	  break;
+	default: return;
   }
 }
 
-static void number(Parser *parser) {
-  emitConstant(parser->previous.value);
+static void number(Compiler *compiler, bool canAssign) {
+  emitConstant(compiler, compiler->parser->previous.value);
 }
 
-static void grouping(Parser *parser) {
-  expression(parser);
-  consume(parser, TOKEN_RIGHT_PAREN);
+static void grouping(Compiler *compiler, bool canAssign) {
+  expression(compiler);
+  consume(compiler, TOKEN_RIGHT_PAREN);
 }
 
-static void binary(Parser *parser) {
-  TokenType t = parser->previous.type;
-  GrammarRule* rule = getRule(t);
-  parsePrecedence(parser, rule->precedence);
+static void binary(Compiler *compiler, bool canAssign) {
+  TokenType t = compiler->parser->previous.type;
+  GrammarRule *rule = getRule(t);
+  parsePrecedence(compiler, rule->precedence);
   switch (t) {
-	case TOKEN_PLUS:  emitByte(OP_ADD); break;
-	case TOKEN_MINUS: emitByte(OP_SUBTRACT); break;
-	case TOKEN_STAR:  emitByte(OP_MULTIPLY); break;
-	case TOKEN_SLASH: emitByte(OP_DIVIDE); break;
-	default:
-	  return; // Unreachable.
+	case TOKEN_PLUS: emitByte(compiler, OP_ADD);
+	  break;
+	case TOKEN_MINUS: emitByte(compiler, OP_SUBTRACT);
+	  break;
+	case TOKEN_STAR: emitByte(compiler, OP_MULTIPLY);
+	  break;
+	case TOKEN_SLASH: emitByte(compiler, OP_DIVIDE);
+	  break;
+	default: return; // Unreachable.
   }
+}
+
+static void literal(Compiler *compiler, bool canAssign) {
+  switch (compiler->parser->previous.type) {
+	case TOKEN_FALSE: emitByte(compiler, OP_FALSE);
+	  break;
+	case TOKEN_NIL: emitByte(compiler, OP_NIL);
+	  break;
+	case TOKEN_TRUE: emitByte(compiler, OP_TRUE);
+	  break;
+	default: return; // Unreachable.
+  }
+}
+
+static bool identifiersEqual(Token *a, Token *b) {
+  if (a->length != b->length) return false;
+  return memcmp(a->start, b->start, a->length) == 0;
+}
+
+static int resolveLocal(Compiler *compiler, Token *name) {
+  for (int i = compiler->localCount - 1; i >= 0; i--) {
+	Local *local = &compiler->locals[i];
+	if (identifiersEqual(name, &local->name)) {
+	  return i;
+	}
+  }
+  return -1;
+}
+
+static void namedVariable(Compiler *compiler, Token name, bool canAssign) {
+  uint8_t getOp, setOp;
+  int arg = resolveLocal(compiler, &name);
+  if (arg != -1) {
+	getOp = OP_GET_LOCAL;
+	setOp = OP_SET_LOCAL;
+  } else {
+	arg = addConstant(&compiler->fn->chunk, name.value);
+	getOp = OP_GET_GLOBAL;
+	setOp = OP_SET_GLOBAL;
+  }
+  if (canAssign && consume(compiler, TOKEN_EQUAL)) {
+	expression(compiler);
+	emitBytes(compiler, setOp, (uint8_t)arg);
+  } else {
+	emitBytes(compiler, getOp, (uint8_t)arg);
+  }
+}
+
+static void variable(Compiler *compiler, bool canAssign) {
+  namedVariable(compiler, compiler->parser->previous, canAssign);
+}
+
+static void string(Compiler *compiler, bool canAssign) {
+  emitConstant(compiler, compiler->parser->previous.value);
+}
+
+static uint8_t argumentList(Compiler *compiler) {
+  uint8_t argCount = 0;
+  if (!consume(compiler, TOKEN_RIGHT_PAREN)) {
+    do {
+      expression(compiler);
+      argCount++;
+    } while (consume(compiler, TOKEN_COMMA));
+  }
+  consume(compiler, TOKEN_RIGHT_PAREN);
+  return argCount;
+}
+
+static void call(Compiler *compiler, bool canAssign) {
+  uint8_t argCount = argumentList(compiler);
+  emitBytes(compiler, OP_CALL, argCount);
 }
 
 GrammarRule rules[] = {
-	{ grouping, NULL,    PREC_NONE },       // TOKEN_LEFT_PAREN
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_RIGHT_PAREN
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_LEFT_BRACE
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_RIGHT_BRACE
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_COMMA
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_DOT
-	{ unary,    binary,  PREC_TERM },       // TOKEN_MINUS
-	{ NULL,     binary,  PREC_TERM },       // TOKEN_PLUS
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_SEMICOLON
-	{ NULL,     binary,  PREC_FACTOR },     // TOKEN_SLASH
-	{ NULL,     binary,  PREC_FACTOR },     // TOKEN_STAR
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_BANG
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_BANG_EQUAL
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_EQUAL
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_EQUAL_EQUAL
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_GREATER
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_GREATER_EQUAL
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_LESS
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_LESS_EQUAL
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_IDENTIFIER
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_STRING
-	{ number,   NULL,    PREC_NONE },       // TOKEN_NUMBER
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_AND
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_CLASS
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_ELSE
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_FALSE
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_FOR
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_FUN
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_IF
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_NIL
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_OR
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_PRINT
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_RETURN
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_SUPER
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_THIS
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_TRUE
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_VAR
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_WHILE
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_ERROR
-	{ NULL,     NULL,    PREC_NONE },       // TOKEN_EOF
+	{grouping, call, PREC_CALL},   // TOKEN_LEFT_PAREN
+	{NULL, NULL, PREC_NONE},       // TOKEN_RIGHT_PAREN
+	{NULL, NULL, PREC_NONE},       // TOKEN_LEFT_BRACE
+	{NULL, NULL, PREC_NONE},       // TOKEN_RIGHT_BRACE
+	{NULL, NULL, PREC_NONE},       // TOKEN_COMMA
+	{NULL, NULL, PREC_NONE},       // TOKEN_DOT
+	{unary, binary, PREC_TERM},    // TOKEN_MINUS
+	{NULL, binary, PREC_TERM},     // TOKEN_PLUS
+	{NULL, NULL, PREC_NONE},       // TOKEN_SEMICOLON
+	{NULL, binary, PREC_FACTOR},   // TOKEN_SLASH
+	{NULL, binary, PREC_FACTOR},   // TOKEN_STAR
+	{NULL, NULL, PREC_NONE},       // TOKEN_BANG
+	{NULL, NULL, PREC_NONE},       // TOKEN_BANG_EQUAL
+	{NULL, NULL, PREC_NONE},       // TOKEN_EQUAL
+	{NULL, NULL, PREC_NONE},       // TOKEN_EQUAL_EQUAL
+	{NULL, NULL, PREC_NONE},       // TOKEN_GREATER
+	{NULL, NULL, PREC_NONE},       // TOKEN_GREATER_EQUAL
+	{NULL, NULL, PREC_NONE},       // TOKEN_LESS
+	{NULL, NULL, PREC_NONE},       // TOKEN_LESS_EQUAL
+	{variable, NULL, PREC_NONE},   // TOKEN_IDENTIFIER
+	{string, NULL, PREC_NONE},     // TOKEN_STRING
+	{number, NULL, PREC_NONE},     // TOKEN_NUMBER
+	{NULL, NULL, PREC_NONE},       // TOKEN_AND
+	{NULL, NULL, PREC_NONE},       // TOKEN_CLASS
+	{NULL, NULL, PREC_NONE},       // TOKEN_ELSE
+	{literal, NULL, PREC_NONE},    // TOKEN_FALSE
+	{NULL, NULL, PREC_NONE},       // TOKEN_FOR
+	{NULL, NULL, PREC_NONE},       // TOKEN_FUN
+	{NULL, NULL, PREC_NONE},       // TOKEN_IF
+	{literal, NULL, PREC_NONE},    // TOKEN_NIL
+	{NULL, NULL, PREC_NONE},       // TOKEN_OR
+	{NULL, NULL, PREC_NONE},       // TOKEN_PRINT
+	{NULL, NULL, PREC_NONE},       // TOKEN_RETURN
+	{NULL, NULL, PREC_NONE},       // TOKEN_SUPER
+	{NULL, NULL, PREC_NONE},       // TOKEN_THIS
+	{literal, NULL, PREC_NONE},    // TOKEN_TRUE
+	{NULL, NULL, PREC_NONE},       // TOKEN_VAR
+	{NULL, NULL, PREC_NONE},       // TOKEN_WHILE
+	{NULL, NULL, PREC_NONE},       // TOKEN_ERROR
+	{NULL, NULL, PREC_NONE},       // TOKEN_EOF
 };
 
-static void parsePrecedence(Parser *parser, Precedence precedence) {
-  nextToken(parser);
-  GrammarFn prefix = getRule(parser->previous.type)->prefix;
+static void parsePrecedence(Compiler *compiler, Precedence precedence) {
+  nextToken(compiler->parser);
+  GrammarFn prefix = getRule(compiler->parser->previous.type)->prefix;
   if (prefix == NULL)
-    return;
-  prefix(parser);
-  while (getRule(parser->current.type)->precedence > precedence) {
-    nextToken(parser);
-    GrammarFn infix = getRule(parser->previous.type)->infix;
-    infix(parser);
+	return;
+  bool canAssign = precedence <= PREC_ASSIGNMENT;
+  prefix(compiler, canAssign);
+  while (getRule(compiler->parser->current.type)->precedence > precedence) {
+	nextToken(compiler->parser);
+	GrammarFn infix = getRule(compiler->parser->previous.type)->infix;
+	infix(compiler, canAssign);
+  }
+  if (canAssign && consume(compiler, TOKEN_EQUAL)) {
+	printf("Invalid assignment target.");
   }
 }
 
@@ -385,24 +509,221 @@ static GrammarRule *getRule(TokenType type) {
   return &rules[type];
 }
 
-static void expression(Parser *parser) {
-  parsePrecedence(parser, PREC_LOWEST);
+static void printStatement(Compiler *compiler) {
+  expression(compiler);
+  consume(compiler, TOKEN_SEMICOLON);
+  emitByte(compiler, OP_PRINT);
 }
 
-bool compile(const char *source, Chunk *chunk) {
+static void expressionStatement(Compiler *compiler) {
+  expression(compiler);
+  consume(compiler, TOKEN_SEMICOLON);
+  emitByte(compiler, OP_POP);
+}
+
+static void addLocal(Compiler *compiler, Token name) {
+  if (compiler->localCount == UINT8_MAX + 1) return;
+  Local *local = &compiler->locals[compiler->localCount++];
+  local->name = name;
+  local->depth = -1;
+}
+
+// For local only.
+static void markInitialized(Compiler *compiler) {
+  if (compiler->scopeDepth == 0) return;
+  compiler->locals[compiler->localCount - 1].depth = compiler->scopeDepth;
+}
+
+// For local only.
+static void declareVariable(Compiler *compiler) {
+  if (compiler->scopeDepth == 0) return;
+  Token name = compiler->parser->previous;
+  addLocal(compiler, name);
+}
+
+static uint8_t parseVariable(Compiler *compiler) {
+  consume(compiler, TOKEN_IDENTIFIER);
+  declareVariable(compiler);
+  if (compiler->scopeDepth > 0) return 0;
+  return addConstant(&compiler->fn->chunk, compiler->parser->previous.value);
+}
+
+static void defineVariable(Compiler *compiler, uint8_t global) {
+  if (compiler->scopeDepth > 0) {
+	markInitialized(compiler);
+	return;
+  }
+  emitBytes(compiler, OP_DEFINE_GLOBAL, global);
+}
+
+static void varDeclaration(Compiler *compiler) {
+  uint8_t global = parseVariable(compiler);
+  if (consume(compiler, TOKEN_EQUAL)) {
+	expression(compiler);
+  } else {
+	emitByte(compiler, OP_NIL);
+  }
+  consume(compiler, TOKEN_SEMICOLON);
+  defineVariable(compiler, global);
+}
+
+static void block(Compiler *compiler) {
+  while (compiler->parser->current.type != TOKEN_RIGHT_BRACE
+	  && compiler->parser->current.type != TOKEN_EOF) {
+	declaration(compiler);
+  }
+  consume(compiler, TOKEN_RIGHT_BRACE);
+}
+
+static void beginScope(Compiler *compiler) {
+  compiler->scopeDepth++;
+}
+
+static void endScope(Compiler *compiler) {
+  compiler->scopeDepth--;
+  while (compiler->localCount > 0 &&
+	  compiler->locals[--compiler->localCount].depth >
+		  compiler->scopeDepth) {
+	emitByte(compiler, OP_POP);
+  }
+}
+
+static int emitJump(Compiler *compiler, uint8_t instruction) {
+  emitByte(compiler, instruction);
+  emitByte(compiler, 0xff);
+  emitByte(compiler, 0xff);
+  return compiler->fn->chunk.count - 2;
+}
+
+static void patchJump(Compiler *compiler, int offset) {
+  Chunk *chunk = &compiler->fn->chunk;
+  int jump = chunk->count - offset - 2;
+  chunk->code[offset] = (jump >> 8) & 0xff;
+  chunk->code[offset + 1] = jump & 0xff;
+}
+
+static void ifStatement(Compiler *compiler) {
+  consume(compiler, TOKEN_LEFT_PAREN);
+  expression(compiler);
+  consume(compiler, TOKEN_RIGHT_PAREN);
+  int thenJump = emitJump(compiler, OP_JUMP_IF);
+  statement(compiler);
+  if (consume(compiler, TOKEN_ELSE)) {
+	int elseJump = emitJump(compiler, OP_JUMP);
+	patchJump(compiler, thenJump);
+	statement(compiler);
+	patchJump(compiler, elseJump);
+  } else {
+	patchJump(compiler, thenJump);
+  }
+}
+
+static void emitLoop(Compiler *compiler, int loopStart) {
+  emitByte(compiler, OP_LOOP);
+  int offset = compiler->fn->chunk.count - loopStart + 2;
+  emitByte(compiler, (offset >> 8) & 0xff);
+  emitByte(compiler, offset & 0xff);
+}
+
+static void whileStatement(Compiler *compiler) {
+  int loopStart = compiler->fn->chunk.count;
+  consume(compiler, TOKEN_LEFT_PAREN);
+  expression(compiler);
+  consume(compiler, TOKEN_RIGHT_PAREN);
+  int exitJump = emitJump(compiler, OP_JUMP_IF);
+  statement(compiler);
+  emitLoop(compiler, loopStart);
+  patchJump(compiler, exitJump);
+}
+
+static void function(Compiler *compiler, FnType type) {
+  Compiler fnCompiler;
+  initCompiler(&fnCompiler, compiler->parser, compiler, type);
+  beginScope(&fnCompiler);
+  consume(&fnCompiler, TOKEN_LEFT_PAREN);
+  if (!consume(&fnCompiler, TOKEN_RIGHT_PAREN)) {
+    do {
+      fnCompiler.fn->arity++;
+      uint8_t paramConstant = parseVariable(&fnCompiler);
+      defineVariable(&fnCompiler, paramConstant);
+    } while (consume(&fnCompiler, TOKEN_COMMA));
+  }
+  consume(&fnCompiler, TOKEN_RIGHT_PAREN);
+  consume(&fnCompiler, TOKEN_LEFT_BRACE);
+  block(&fnCompiler);
+  ObjFn *fn = endCompiler(&fnCompiler);
+  emitConstant(compiler, OBJ_VAL(fn));
+}
+
+static void funDeclaration(Compiler *compiler) {
+  uint8_t global = parseVariable(compiler);
+  markInitialized(compiler);
+  function(compiler, TYPE_FUNCTION);
+  defineVariable(compiler, global);
+}
+
+static void returnStatement(Compiler *compiler) {
+  //if (compiler->type == TYPE_SCRIPT) {}
+  if (consume(compiler, TOKEN_SEMICOLON)) {
+    emitReturn(compiler);
+  } else {
+    expression(compiler);
+    consume(compiler, TOKEN_SEMICOLON);
+    emitByte(compiler, OP_RETURN);
+  }
+}
+
+static void expression(Compiler *compiler) {
+  parsePrecedence(compiler, PREC_LOWEST);
+}
+
+static void declaration(Compiler *compiler) {
+  if (consume(compiler, TOKEN_FUN)) {
+	funDeclaration(compiler);
+  } else if (consume(compiler, TOKEN_VAR)) {
+	varDeclaration(compiler);
+  } else {
+	statement(compiler);
+  }
+}
+
+static void statement(Compiler *compiler) {
+  if (consume(compiler, TOKEN_PRINT)) {
+	printStatement(compiler);
+  } else if (consume(compiler, TOKEN_LEFT_BRACE)) {
+	beginScope(compiler);
+	block(compiler);
+	endScope(compiler);
+  } else if (consume(compiler, TOKEN_IF)) {
+	ifStatement(compiler);
+  } else if (consume(compiler, TOKEN_WHILE)) {
+	whileStatement(compiler);
+  } else if (consume(compiler, TOKEN_RETURN)) {
+    returnStatement(compiler);
+  } else {
+	expressionStatement(compiler);
+  }
+}
+
+ObjFn *compile(VM *vm, const char *source) {
   Parser parser;
+  parser.vm = vm;
   parser.source = source;
   parser.tokenStart = source;
   parser.currentChar = source;
-  compilingChunk = chunk;
+  parser.current.type = TOKEN_ERROR;
+  parser.current.start = source;
+  parser.current.length = 0;
+  Compiler compiler;
+  initCompiler(&compiler, &parser, NULL, TYPE_SCRIPT);
   /*for (;;) {
 	nextToken(&parser);
 	printf("%2d '%.*s'\n", parser.current.type, parser.current.length, parser.current.start);
 	if (parser.current.type == TOKEN_EOF) break;
   }*/
   nextToken(&parser);
-  expression(&parser);
-  consume(&parser, TOKEN_EOF);
-  endCompiler();
-  return true;
+  while (!consume(&compiler, TOKEN_EOF)) {
+	declaration(&compiler);
+  }
+  return endCompiler(&compiler);
 }

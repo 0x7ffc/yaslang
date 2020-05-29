@@ -1,7 +1,9 @@
 #include <stdio.h>
+#include <string.h>
 
-#include "value.h"
+#include "vm.h"
 #include "memory.h"
+#include "object.h"
 
 void initValueArray(ValueArray *array) {
   array->values = NULL;
@@ -20,10 +22,18 @@ void writeValueArray(ValueArray *array, Value value) {
 }
 
 void freeValueArray(ValueArray *array) {
-  FREE_ARRAY(array->values);
+  FREE(array->values);
   initValueArray(array);
 }
 
 void printValue(Value value) {
-  printf("%g", value);
+  if (IS_BOOL(value)) {
+	printf(AS_BOOL(value) ? "true" : "false");
+  } else if (IS_NIL(value)) {
+	printf("nil");
+  } else if (IS_NUMBER(value)) {
+	printf("%g", AS_NUM(value));
+  } else if (IS_OBJ(value)) {
+	printObject(value);
+  }
 }
