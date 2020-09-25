@@ -2,6 +2,7 @@
 #define CLOX_VALUE_H
 
 #include "common.h"
+#include "clox.h"
 
 #define SIGN_BIT   ((uint64_t)0x8000000000000000)
 #define QNAN       ((uint64_t)0x7ffc000000000000)
@@ -30,8 +31,10 @@ typedef uint64_t Value;
 #define AS_FN(v)             ((ObjFn*)AS_OBJ(v))
 #define AS_STRING(v)         ((ObjString*)AS_OBJ(v))
 #define AS_CSTRING(v)        (((ObjString*)AS_OBJ(v))->value)
+#define AS_NATIVE(v)         (((ObjNative*)AS_OBJ(v)))->fn
+#define AS_CLOSURE(v)        ((ObjClosure*)AS_OBJ(v))
 
-#define OBJ_TYPE(value)         (AS_OBJ(value)->type)
+#define OBJ_TYPE(value)      (AS_OBJ(value)->type)
 
 typedef union {
   uint64_t bits;
@@ -57,9 +60,10 @@ typedef struct {
 } ValueArray;
 
 void initValueArray(ValueArray *array);
-void writeValueArray(ValueArray *array, Value value);
-void freeValueArray(ValueArray *array);
+void writeValueArray(VM *vm, ValueArray *array, Value value);
+void freeValueArray(VM *vm, ValueArray *array);
 
 void printValue(Value value);
+bool valueEqual(Value a, Value b);
 
 #endif

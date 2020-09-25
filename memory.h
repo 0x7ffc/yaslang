@@ -3,21 +3,26 @@
 
 #include "common.h"
 #include "clox.h"
+#include "value.h"
+#include "object.h"
 
 #define GROW_CAPACITY(capacity) \
     ((capacity) == 0 ? 8 : (capacity * 2))    // 8 as default ???
 
-#define ALLOCATE_FLEX(main, sub, count) \
-    (main*)reallocate(NULL, 0, sizeof(main) + sizeof(sub) * count)
+#define ALLOCATE(vm, type) \
+	((type*)reallocate(vm, NULL, 0, sizeof(type)))
 
-#define ALLOCATE(type, count) \
-    (type*)reallocate(NULL, 0, sizeof(type) * (count))
+#define ALLOCATE_FLEX(vm, main, sub, count) \
+	((main*)reallocate(vm, NULL, 0, sizeof(main) + sizeof(sub) * count))
 
-#define GROW_ARRAY(array, type, old, new) \
-    (type*)reallocate(array, sizeof(type) * (old), sizeof(type) * (new))
+#define ALLOCATE_ARRAY(vm, type, count) \
+    ((type*)reallocate(vm, NULL, 0, sizeof(type) * (count)))
 
-#define FREE(pointer) \
-    reallocate(pointer, 0, 0)
+#define GROW_ARRAY(vm, array, type, old, new) \
+	((type*)reallocate(vm, array, sizeof(type) * (old), sizeof(type) * (new)))
+
+#define DEALLOCATE(vm, pointer) \
+    reallocate(vm, pointer, 0, 0)
 
 
 // oldSize 	    newSize 	            Operation
@@ -28,7 +33,10 @@
 //
 // As an implication, size_t is a type guaranteed to hold any array index.
 
-void *reallocate(void *array, size_t old, size_t new);
+void *reallocate(VM *vm, void *array, size_t old, size_t new);
+void markObject(VM* vm, Obj* object);
+void markValue(VM *vm, Value value);
 void freeObjects(VM *vm);
+void gc(VM *vm);
 
 #endif

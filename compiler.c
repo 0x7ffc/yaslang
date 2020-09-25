@@ -4,6 +4,7 @@
 
 #include "compiler.h"
 #include "vm.h"
+#include "memory.h"
 
 typedef enum {
   // Single-character tokens.
@@ -56,7 +57,13 @@ typedef struct {
 typedef struct {
   Token name;
   int depth;
+  bool isCaptured;
 } Local;
+
+typedef struct {
+  uint8_t index;
+  bool isLocal;
+} Upvalue;
 
 typedef enum {
   TYPE_FUNCTION,
@@ -67,6 +74,7 @@ struct sCompiler {
   Parser *parser;
   Local locals[UINT8_MAX + 1];
   int localCount;
+  Upvalue upvalues[UINT8_MAX + 1];
   int scopeDepth;
   ObjFn *fn;
   FnType type;
@@ -296,6 +304,7 @@ static void initCompiler(Compiler *compiler, Parser *parser,
   local->depth = 0;
   local->name.start = "";
   local->name.length = 0;
+  local->isCaptured = false;
 }
 
 static bool consume(Compiler *compiler, TokenType type) {
@@ -307,7 +316,7 @@ static bool consume(Compiler *compiler, TokenType type) {
 }
 
 static void emitByte(Compiler *compiler, uint8_t byte) {
-  writeChunk(&compiler->fn->chunk, byte);
+  writeChunk(compiler->parser->vm, &compiler->fn->chunk, byte);
 }
 
 static void emitBytes(Compiler *compiler, uint8_t byte1, uint8_t byte2) {
@@ -315,8 +324,12 @@ static void emitBytes(Compiler *compiler, uint8_t byte1, uint8_t byte2) {
   emitByte(compiler, byte2);
 }
 
+static int makeConstant(Compiler *compiler, Value value) {
+  return addConstant(compiler->parser->vm, &compiler->fn->chunk, value);
+}
+
 void emitConstant(Compiler *compiler, Value value) {
-  int index = addConstant(&compiler->fn->chunk, value);
+  int index = makeConstant(compiler, value);
   if (index < 256) {
 	emitBytes(compiler, OP_CONSTANT, index);
   } else {
@@ -370,6 +383,10 @@ static void binary(Compiler *compiler, bool canAssign) {
 	  break;
 	case TOKEN_SLASH: emitByte(compiler, OP_DIVIDE);
 	  break;
+    case TOKEN_LESS: emitByte(compiler, OP_LESS);
+      break;
+    case TOKEN_EQUAL_EQUAL: emitByte(compiler, OP_EQ);
+      break;
 	default: return; // Unreachable.
   }
 }
@@ -401,14 +418,45 @@ static int resolveLocal(Compiler *compiler, Token *name) {
   return -1;
 }
 
+static int addUpvalue(Compiler *compiler, uint8_t index, bool isLocal) {
+  int upvalueCount = compiler->fn->upvalueCount;
+  for (int i = 0; i < upvalueCount; i++) {
+    Upvalue *upvalue = &compiler->upvalues[i];
+    if (upvalue->index == index && upvalue->isLocal == isLocal) {
+      return i;
+    }
+  }
+  //if (upvalueCount == UINT8_MAX + 1) { }
+  compiler->upvalues[upvalueCount].isLocal = isLocal;
+  compiler->upvalues[upvalueCount].index = index;
+  return compiler->fn->upvalueCount++;
+}
+
+static int resolveUpvalue(Compiler *compiler, Token* name) {
+  if (compiler->parent == NULL) return -1;
+  int local = resolveLocal(compiler->parent, name);
+  if (local != -1) {
+    compiler->parent->locals[local].isCaptured = true;
+    return addUpvalue(compiler, (uint8_t)local, true);
+  }
+  int upvalue = resolveUpvalue(compiler->parent, name);
+  if (upvalue != -1) {
+    return addUpvalue(compiler, (uint8_t)upvalue, false);
+  }
+  return -1;
+}
+
 static void namedVariable(Compiler *compiler, Token name, bool canAssign) {
   uint8_t getOp, setOp;
   int arg = resolveLocal(compiler, &name);
   if (arg != -1) {
 	getOp = OP_GET_LOCAL;
 	setOp = OP_SET_LOCAL;
+  } else if ((arg = resolveUpvalue(compiler, &name)) != -1) {
+    getOp = OP_GET_UPVALUE;
+    setOp = OP_SET_UPVALUE;
   } else {
-	arg = addConstant(&compiler->fn->chunk, name.value);
+	arg = makeConstant(compiler, name.value);
 	getOp = OP_GET_GLOBAL;
 	setOp = OP_SET_GLOBAL;
   }
@@ -458,13 +506,13 @@ GrammarRule rules[] = {
 	{NULL, binary, PREC_FACTOR},   // TOKEN_SLASH
 	{NULL, binary, PREC_FACTOR},   // TOKEN_STAR
 	{NULL, NULL, PREC_NONE},       // TOKEN_BANG
-	{NULL, NULL, PREC_NONE},       // TOKEN_BANG_EQUAL
+	{NULL, binary, PREC_EQUALITY}, // TOKEN_BANG_EQUAL
 	{NULL, NULL, PREC_NONE},       // TOKEN_EQUAL
-	{NULL, NULL, PREC_NONE},       // TOKEN_EQUAL_EQUAL
-	{NULL, NULL, PREC_NONE},       // TOKEN_GREATER
-	{NULL, NULL, PREC_NONE},       // TOKEN_GREATER_EQUAL
-	{NULL, NULL, PREC_NONE},       // TOKEN_LESS
-	{NULL, NULL, PREC_NONE},       // TOKEN_LESS_EQUAL
+	{NULL, binary,  PREC_EQUALITY },   // TOKEN_EQUAL_EQUAL
+	{NULL, binary,  PREC_COMPARISON }, // TOKEN_GREATER
+	{NULL, binary,  PREC_COMPARISON }, // TOKEN_GREATER_EQUAL
+	{NULL, binary,  PREC_COMPARISON }, // TOKEN_LESS
+	{NULL, binary,  PREC_COMPARISON }, // TOKEN_LESS_EQUAL
 	{variable, NULL, PREC_NONE},   // TOKEN_IDENTIFIER
 	{string, NULL, PREC_NONE},     // TOKEN_STRING
 	{number, NULL, PREC_NONE},     // TOKEN_NUMBER
@@ -526,6 +574,7 @@ static void addLocal(Compiler *compiler, Token name) {
   Local *local = &compiler->locals[compiler->localCount++];
   local->name = name;
   local->depth = -1;
+  local->isCaptured = false;
 }
 
 // For local only.
@@ -545,7 +594,7 @@ static uint8_t parseVariable(Compiler *compiler) {
   consume(compiler, TOKEN_IDENTIFIER);
   declareVariable(compiler);
   if (compiler->scopeDepth > 0) return 0;
-  return addConstant(&compiler->fn->chunk, compiler->parser->previous.value);
+  return makeConstant(compiler, compiler->parser->previous.value);
 }
 
 static void defineVariable(Compiler *compiler, uint8_t global) {
@@ -582,9 +631,14 @@ static void beginScope(Compiler *compiler) {
 static void endScope(Compiler *compiler) {
   compiler->scopeDepth--;
   while (compiler->localCount > 0 &&
-	  compiler->locals[--compiler->localCount].depth >
+	  compiler->locals[compiler->localCount - 1].depth >
 		  compiler->scopeDepth) {
-	emitByte(compiler, OP_POP);
+	if (compiler->locals[compiler->localCount - 1].isCaptured) {
+	  emitByte(compiler, OP_CLOSE_UPVALUE);
+	} else {
+	  emitByte(compiler, OP_POP);
+	}
+	compiler->localCount--;
   }
 }
 
@@ -652,7 +706,11 @@ static void function(Compiler *compiler, FnType type) {
   consume(&fnCompiler, TOKEN_LEFT_BRACE);
   block(&fnCompiler);
   ObjFn *fn = endCompiler(&fnCompiler);
-  emitConstant(compiler, OBJ_VAL(fn));
+  emitBytes(compiler, OP_CLOSURE, makeConstant(compiler, OBJ_VAL(fn)));
+  for (int i = 0; i < fn->upvalueCount; i++) {
+    emitByte(compiler, fnCompiler.upvalues[i].isLocal ? 1 : 0);
+    emitByte(compiler, fnCompiler.upvalues[i].index);
+  }
 }
 
 static void funDeclaration(Compiler *compiler) {
@@ -669,7 +727,12 @@ static void returnStatement(Compiler *compiler) {
   } else {
     expression(compiler);
     consume(compiler, TOKEN_SEMICOLON);
-    emitByte(compiler, OP_RETURN);
+	if (compiler->fn->chunk.count >= 2  &&
+	    compiler->fn->chunk.code[compiler->fn->chunk.count - 2] == OP_CALL) {
+	  compiler->fn->chunk.code[compiler->fn->chunk.count - 2] = OP_TAIL_CALL;
+	} else {
+	  emitByte(compiler, OP_RETURN);
+	}
   }
 }
 
@@ -726,4 +789,12 @@ ObjFn *compile(VM *vm, const char *source) {
 	declaration(&compiler);
   }
   return endCompiler(&compiler);
+}
+
+void markCompilerRoots(VM *vm, Compiler *compiler) {
+  Compiler* c = compiler;
+  while (c != NULL) {
+	markObject(vm, (Obj*)c->fn);
+	c = c->parent;
+  }
 }

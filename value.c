@@ -3,7 +3,6 @@
 
 #include "vm.h"
 #include "memory.h"
-#include "object.h"
 
 void initValueArray(ValueArray *array) {
   array->values = NULL;
@@ -11,18 +10,18 @@ void initValueArray(ValueArray *array) {
   array->count = 0;
 }
 
-void writeValueArray(ValueArray *array, Value value) {
+void writeValueArray(VM *vm, ValueArray *array, Value value) {
   if (array->count == array->capacity) {
 	array->capacity = GROW_CAPACITY(array->capacity);
-	array->values = GROW_ARRAY(array->values, Value,
+	array->values = GROW_ARRAY(vm, array->values, Value,
 							   array->count, array->capacity);
   }
   array->values[array->count] = value;
   array->count++;
 }
 
-void freeValueArray(ValueArray *array) {
-  FREE(array->values);
+void freeValueArray(VM *vm, ValueArray *array) {
+  DEALLOCATE(vm, array->values);
   initValueArray(array);
 }
 
@@ -36,4 +35,9 @@ void printValue(Value value) {
   } else if (IS_OBJ(value)) {
 	printObject(value);
   }
+}
+
+bool valueEqual(Value a, Value b) {
+  if (IS_NUMBER(a) && IS_NUMBER(b)) return AS_NUM(a) == AS_NUM(b);
+  return a == b;
 }

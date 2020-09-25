@@ -5,24 +5,56 @@
 #include "vm.h"
 #include "memory.h"
 
-static void initObj(VM *vm, Obj *obj, ObjType type) {
+static void initObj(VM *vm, Obj *obj, ObjType type, size_t size) {
   obj->type = type;
   obj->next = vm->first;
+  obj->isMarked = false;
   vm->first = obj;
+  #ifdef DEBUG_LOG_GC
+  printf("%p allocate %ld for %d\n", (void*)obj, size, type);
+  #endif
 }
 
 ObjFn *newFn(VM *vm) {
-  ObjFn *fn = ALLOCATE(ObjFn, 1);
-  initObj(vm, &fn->obj, OBJ_FN);
+  ObjFn *fn = ALLOCATE(vm, ObjFn);
+  initObj(vm, &fn->obj, OBJ_FN, sizeof(*fn));
   fn->arity = 0;
+  fn->upvalueCount = 0;
   fn->name = NULL;
   initChunk(&fn->chunk);
   return fn;
 }
 
+ObjClosure *newClosure(VM *vm, ObjFn* fn) {
+  ObjClosure *closure = ALLOCATE_FLEX(vm, ObjClosure, ObjUpvalue*, fn->upvalueCount);
+  initObj(vm, &closure->obj, OBJ_CLOSURE, sizeof(*closure));
+  for (int i = 0; i < fn->upvalueCount; i++) {
+	closure->upvalues[i] = NULL;
+  }
+  closure->fn = fn;
+  closure->upvalueCount = fn->upvalueCount;
+  return closure;
+}
+
+ObjUpvalue *newUpvalue(VM *vm, Value *slot) {
+  ObjUpvalue *upvalue = ALLOCATE(vm, ObjUpvalue);
+  initObj(vm, &upvalue->obj, OBJ_UPVALUE, sizeof(*upvalue));
+  upvalue->location = slot;
+  upvalue->closed = NIL_VAL;
+  upvalue->next = NULL;
+  return upvalue;
+}
+
+ObjNative *newNative(VM *vm, NativeFn fn) {
+  ObjNative *native = ALLOCATE(vm, ObjNative);
+  initObj(vm, &native->obj, OBJ_NATIVE, sizeof(*native));
+  native->fn = fn;
+  return native;
+}
+
 static ObjString *allocateString(VM *vm, size_t length) {
-  ObjString *string = ALLOCATE_FLEX(ObjString, char, length + 1);
-  initObj(vm, &string->obj, OBJ_STRING);
+  ObjString *string = ALLOCATE_FLEX(vm, ObjString, char, length + 1);
+  initObj(vm, &string->obj, OBJ_STRING, sizeof(*string));
   string->length = (int)length;
   string->value[length] = '\0';
   return string;
@@ -45,7 +77,7 @@ Value newStringLength(VM *vm, const char *text, size_t length) {
   ObjString *string = allocateString(vm, length);
   if (length > 0 && text != NULL) memcpy(string->value, text, length);
   string->hash = hash;
-  tableSet(&vm->strings, string, NIL_VAL);
+  tableSet(vm, &vm->strings, string, NIL_VAL);
   return OBJ_VAL(string);
 }
 
@@ -61,7 +93,24 @@ void printObject(Value value) {
 		printf("<script>");
 		return;
 	  }
-	  printf("<fn %s>", AS_FN(value)->name->value);
+	  printf("<fn %s>", fn->name->value);
+	  break;
+	}
+	case OBJ_NATIVE: {
+	  printf("<native fn>");
+	  break;
+	}
+	case OBJ_CLOSURE: {
+	  ObjFn *fn = AS_CLOSURE(value)->fn;
+	  if (fn->name == NULL) {
+		printf("<script>");
+		return;
+	  }
+	  printf("<fn %s>", fn->name->value);
+	  break;
+	}
+	case OBJ_UPVALUE: {
+	  printf("upvalue");
 	  break;
 	}
   }
@@ -73,8 +122,8 @@ void initTable(Table *table) {
   table->entries = NULL;
 }
 
-void freeTable(Table *table) {
-  FREE(table->entries);
+void freeTable(VM *vm, Table *table) {
+  DEALLOCATE(vm, table->entries);
   initTable(table);
 }
 
@@ -97,8 +146,8 @@ static Entry *findEntry(Entry *entries, int capacity,
   }
 }
 
-static void adjustCapacity(Table *table, int capacity) {
-  Entry *entries = ALLOCATE(Entry, capacity);
+static void adjustCapacity(VM *vm, Table *table, int capacity) {
+  Entry *entries = ALLOCATE_ARRAY(vm, Entry, capacity);
   for (int i = 0; i < capacity; i++) {
 	entries[i].key = NULL;
 	entries[i].value = NIL_VAL;
@@ -113,7 +162,7 @@ static void adjustCapacity(Table *table, int capacity) {
 	dest->value = entry->value;
 	table->count++;
   }
-  FREE(table->entries);
+  DEALLOCATE(vm, table->entries);
   table->entries = entries;
   table->capacity = capacity;
 }
@@ -128,10 +177,10 @@ bool tableGet(Table *table, ObjString *key, Value *value) {
   return true;
 }
 
-bool tableSet(Table *table, ObjString *key, Value value) {
+bool tableSet(VM *vm, Table *table, ObjString *key, Value value) {
   if (table->count + 1 > table->capacity * TABLE_MAX_LOAD) {
 	int capacity = GROW_CAPACITY(table->capacity);
-	adjustCapacity(table, capacity);
+	adjustCapacity(vm, table, capacity);
   }
   Entry *entry = findEntry(table->entries, table->capacity, key);
   bool isNewKey = entry->key == NULL;
@@ -155,15 +204,6 @@ bool tableDelete(Table *table, ObjString *key) {
   return true;
 }
 
-void tableAddAll(Table *from, Table *to) {
-  for (int i = 0; i < from->capacity; i++) {
-	Entry *entry = &from->entries[i];
-	if (entry->key != NULL) {
-	  tableSet(to, entry->key, entry->value);
-	}
-  }
-}
-
 ObjString *tableFindString(Table *table, const char *chars, int length,
 						   uint32_t hash) {
   if (table->count == 0) return NULL;
@@ -180,5 +220,22 @@ ObjString *tableFindString(Table *table, const char *chars, int length,
 	  return entry->key;
 	}
 	index = (index + 1) % table->capacity;
+  }
+}
+
+void markTable(VM *vm, Table* table) {
+  for (int i = 0; i < table->capacity; i++) {
+	Entry* entry = &table->entries[i];
+	markObject(vm, (Obj*)entry->key);
+	markValue(vm, entry->value);
+  }
+}
+
+void tableRemoveWhite(Table* table){
+  for (int i = 0; i < table->capacity; i++) {
+	Entry *entry = &table->entries[i];
+	if (entry->key != NULL && !entry->key->obj.isMarked) {
+	  tableDelete(table, entry->key);
+	}
   }
 }

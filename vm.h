@@ -9,7 +9,7 @@
 #include "compiler.h"
 
 typedef struct {
-  ObjFn *fn;
+  ObjClosure *closure;
   uint8_t *ip;
   Value *slots;
 } CallFrame;
@@ -28,6 +28,14 @@ struct VM {
   Table strings;
   Obj *first;
   Compiler *compiler;
+  ObjUpvalue *openUpvalues;
+
+  size_t bytesAllocated;
+  size_t nextGC;
+
+  int grayCount;
+  int grayCapacity;
+  Obj **grayStack;
 };
 
 typedef enum {

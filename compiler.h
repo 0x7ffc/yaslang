@@ -8,5 +8,6 @@
 typedef struct sCompiler Compiler;
 
 ObjFn *compile(VM *vm, const char *source);
+void markCompilerRoots(VM *vm, Compiler *compiler);
 
 #endif

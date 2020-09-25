@@ -52,8 +52,7 @@ static void runFile(VM *vm, const char* path) {
 int main() {
   VM vm;
   initVM(&vm);
-  //repl(&vm);
-  runFile(&vm, "/mnt/c/Users/gezim/CLionProjects/clox/test/t1.clox");
+  repl(&vm);
   freeVM(&vm);
   return 0;
 }
